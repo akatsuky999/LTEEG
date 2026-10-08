@@ -1,9 +1,10 @@
 """Minimal name -> factory registries.
 
-Components (models, losses, preprocessing operators, augmentations) register
+Small components (losses, preprocessing operators, augmentations) register
 themselves with a decorator. A name of the form ``"package.module:Attribute"`` is
 imported on demand, so research code living outside this package can be plugged in
-from the config without editing the framework.
+from the config without editing the framework. Models are not registered: each one
+is a package selected by its folder name (see :mod:`lteeg.models`).
 """
 
 from __future__ import annotations
@@ -67,11 +68,14 @@ def call_with_checked_kwargs(factory: Callable[..., Any], kind: str, name: str, 
         unknown = [k for k in kwargs if k not in params]
         if unknown:
             accepted = [k for k, p in params.items() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
-            raise RegistryError(f"{kind} '{name}' got unexpected parameter(s) {unknown}; accepted: {accepted}")
+            hints = [f"'{k}' -> '{c[0]}'" for k in unknown
+                     for c in [difflib.get_close_matches(k, accepted, n=1)] if c]
+            hint = f" (did you mean {', '.join(hints)}?)" if hints else ""
+            raise RegistryError(f"{kind} '{name}' got unexpected parameter(s) {unknown}{hint}; "
+                                f"accepted: {accepted}")
     return factory(**kwargs)
 
 
-MODELS = Registry("model")
 LOSSES = Registry("loss")
 PREPROCESSORS = Registry("preprocessing op")
 AUGMENTATIONS = Registry("augmentation")

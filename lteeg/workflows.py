@@ -22,7 +22,7 @@ from .evaluation.runner import evaluate_recordings
 from .evaluation.sweep import sweep, write_manifest
 from .inference.longrange import predict_recording
 from .inference.postprocess import mask_to_events, postprocess
-from .models import build_model, count_parameters, describe_model
+from .models import build_model
 from .task import Task
 from .utils import natural_key, seed_everything, write_json
 from .utils.logging import get_logger, setup_logging
@@ -260,47 +260,42 @@ def predict(checkpoint: Path, inputs: Sequence[Path], out_dir: Path, overrides: 
 
 # ---------------------------------------------------------------------- check-model
 def check_model(cfg: Config, batch_size: int = 2, overfit_steps: int = 0) -> Dict[str, Any]:
-    """Build the configured model, verify the I/O contract, time forward/backward and
-    optionally overfit one synthetic batch (a quick convergence sanity check)."""
+    """Build the configured model and run the model-contract checks
+    (:func:`lteeg.models.contract.check_contract`) at the real input size; report size,
+    speed and GPU memory; optionally overfit one synthetic batch (a quick convergence
+    sanity check)."""
     from .losses import build_loss
     from .models import as_output
+    from .models.contract import check_contract
     from .task import align_logits
 
     device = resolve_device(cfg.experiment.device)
     seed_everything(cfg.experiment.seed)
     task = Task(cfg)
-    model = build_model(cfg, task.num_outputs).to(device)
-    print(describe_model(model))
     T = cfg.window_samples
-    x = torch.randn(batch_size, cfg.n_channels, T, device=device)
-    y = torch.zeros(batch_size, T, dtype=torch.long, device=device)
-    y[:, T // 3: T // 2] = 1
-    loss_fn = build_loss(cfg)
-    model.train()
-    t0 = time.time()
-    out = as_output(model(x))
-    logits = out.logits
-    if logits.ndim != 3 or logits.shape[0] != batch_size or logits.shape[1] != task.num_outputs:
-        raise ValueError(f"model output {tuple(logits.shape)} violates the contract (B, {task.num_outputs}, T')")
-    loss, _ = loss_fn(align_logits(logits.float(), T), y)
-    loss.backward()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    info = {"params": count_parameters(model), "output_shape": tuple(logits.shape), "input_samples": T,
-            "fwd_bwd_sec": time.time() - t0, "initial_loss": float(loss.detach())}
-    if device.type == "cuda":
-        info["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1024 ** 3
-    print(f"forward/backward OK: output {tuple(logits.shape)} for input {(batch_size, cfg.n_channels, T)}, "
-          f"loss {info['initial_loss']:.4f}, {info['fwd_bwd_sec']:.2f}s")
-    if "peak_mem_gb" in info:
-        print(f"peak GPU memory (fp32 forward/backward, no optimizer state): {info['peak_mem_gb']:.1f} GB")
+    # cuDNN may pick different (equally valid) algorithms for different batch sizes on GPU
+    tolerance = {"rtol": 1e-3, "atol": 1e-4} if device.type == "cuda" else {}
+    report = check_contract(lambda: build_model(cfg, task.num_outputs), cfg.n_channels, T, task.num_outputs,
+                            batch_size=batch_size, device=str(device), seed=cfg.experiment.seed,
+                            name=cfg.model.name, **tolerance)
+    print(report)
+    info: Dict[str, Any] = dataclasses.asdict(report)
     if overfit_steps:
+        torch.manual_seed(cfg.experiment.seed)
+        model = build_model(cfg, task.num_outputs).to(device).train()
+        x = torch.randn(batch_size, cfg.n_channels, T, device=device)
+        y = torch.zeros(batch_size, T, dtype=torch.long, device=device)
+        y[:, T // 3: T // 2] = 1
+        loss_fn = build_loss(cfg)
         opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-        for step in range(overfit_steps):
+        first = last = None
+        for _ in range(overfit_steps):
             opt.zero_grad()
-            l, _ = loss_fn(align_logits(as_output(model(x)).logits.float(), T), y)
-            l.backward()
+            loss, _ = loss_fn(align_logits(as_output(model(x)).logits.float(), T), y)
+            loss.backward()
             opt.step()
-        info["overfit_final_loss"] = float(l)
-        print(f"overfit {overfit_steps} steps on one batch: loss {info['initial_loss']:.4f} -> {float(l):.4f}")
+            first = float(loss.detach()) if first is None else first
+            last = float(loss.detach())
+        info["overfit_final_loss"] = last
+        print(f"overfit {overfit_steps} steps on one batch: loss {first:.4f} -> {last:.4f}")
     return info

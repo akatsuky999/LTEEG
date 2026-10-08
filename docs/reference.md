@@ -57,13 +57,19 @@ LTEEG/
 │   │   ├── windows.py            # 窗口索引、background/boundary/full 分类、采样器
 │   │   ├── datasets.py           # 训练窗 Dataset（逐点标签，-1 为忽略）
 │   │   └── augment.py            # GPU 上的批量增强
-│   ├── models/                   # 模型契约 + SeizureTransformer + 轻量 TCN
+│   ├── models/                   # 每个模型一个文件夹，文件夹名即 model.name
+│   │   ├── base.py               # 模型约定（构造签名、输入输出、可选成员）
+│   │   ├── contract.py           # 约定的可执行检查（测试与 check-model 共用）
+│   │   ├── _template/            # 新模型模板：__init__.py + model.py + layers/ + README.md
+│   │   ├── seizure_transformer/  # 默认 baseline（U-Net + Transformer，逐采样点输出）
+│   │   ├── dcrnn/                # 图扩散卷积 GRU（Tang et al., ICLR 2022 的 EEG 设置，每秒一个输出）
+│   │   └── tcn/                  # 轻量膨胀卷积网络
 │   ├── losses.py                 # bce / ce / focal / dice / tmse，可加权组合
 │   ├── engine/                   # Trainer、优化器与调度、EMA、检查点、预取
 │   ├── inference/                # 整段记录连续推理与拼接、后处理
 │   └── evaluation/               # SzCORE 评分、AUROC/AUPRC、报表、阈值扫描、多实验对比
 ├── docs/design_notes.md
-└── tests/                        # 73 个测试（约 25 秒，CPU 即可）
+└── tests/                        # 全部测试约 1 分钟，CPU 即可
 ```
 
 ## 安装
@@ -100,11 +106,13 @@ python -m lteeg inspect                 # 校验全部数据与标注，打印�
 python -m lteeg prepare --jobs 4        # 一次性构建预处理缓存（可选，train 会自动补齐）
 python -m lteeg train                   # SeizureTransformer baseline，默认配置即 configs/chbmit.yaml
 python -m lteeg train --config configs/experiments/original_faithful.yaml
+python -m lteeg train --config configs/experiments/dcrnn.yaml   # DCRNN（Tang et al. 的训练设置）
 python -m lteeg evaluate runs/chbmit/<run>/checkpoints/best.pt --splits dev
 python -m lteeg sweep runs/chbmit/<run>/eval/dev_best --thresholds 0.5 0.6 0.7 0.8 0.9 --min-durations 2 5 10
 python -m lteeg compare runs/chbmit     # 多个实验并排比较（pooled、病人宏平均、最差病人、逐病人）
 python -m lteeg predict runs/chbmit/<run>/checkpoints/best.pt F:/EEG/new_patient --out preds/
-python -m lteeg check-model --set model.name=my_net --overfit-steps 50   # 新网络接入自检
+python -m lteeg list-models             # 内置模型、可调参数与默认值
+python -m lteeg check-model --set model.name=my_net --overfit-steps 50   # 模型约定检查 + 单 batch 过拟合
 ```
 
 不带 `--config` 时使用 `configs/chbmit.yaml`。任何配置项都能用 `--set 键=值` 覆盖，例如
@@ -268,31 +276,61 @@ runs/chbmit/<name>_<时间戳>/
 
 ## 接入新模型
 
-模型就是一个 `nn.Module`，构造签名与输入输出约定如下：
+### 组织方式
+
+每个模型一个文件夹，文件夹名就是 `model.name`（参考 THUML Time-Series-Library）：
+
+```
+lteeg/models/my_net/
+├── __init__.py   导出 Model（模型类）和 SMOKE_PARAMS（快速测试用的小参数）
+├── model.py      网络主体：组装 layers/ 中的模块，定义 forward
+├── layers/       该模型自己的模块
+└── README.md     来源、参数、与参考实现的差异、核验
+```
+
+从模板开始：`cp -r lteeg/models/_template lteeg/models/my_net`。以 `_` 开头的文件夹（如 `_template`）不会被当作模型。只有被选中的模型包会被导入，因此某个模型的可选依赖或错误不会影响其他模型。框架外的模型用 `model.name: "包.模块:类名"` 引用，约定相同。
+
+### 约定（完整说明见 `lteeg/models/base.py`）
 
 ```python
-# my_models/unet.py
-import torch.nn as nn
-from lteeg.registry import MODELS
-
-@MODELS.register("my_unet")            # 或不注册，配置里写 model.name: "my_models.unet:MyUNet"
-class MyUNet(nn.Module):
-    output_stride = 1                  # 输出时间分辨率比输入低 r 倍时设为 r（如 patch/token 级模型）
-
-    def __init__(self, in_channels, in_samples, num_outputs, depth=4, width=32):
+class MyNet(nn.Module):
+    def __init__(self, in_channels, in_samples, num_outputs, fs, depth=4, width=32):
         super().__init__()
         ...
 
     def forward(self, x):              # x: (B, C, T) 已预处理的 float32
-        return logits                  # (B, num_outputs, T) 或 (B, num_outputs, T // r)
+        return logits                  # (B, num_outputs, T')，1 <= T' <= T
 ```
 
-- `num_outputs` 由任务决定（二分类为 1，多分类为类别数），`in_channels`/`in_samples` 来自配置，其余参数来自 `model.params`，名字拼错会直接报错并列出可接受的参数。
-- 输出分辨率低于输入时，框架会在计算损失和推理前把 logits 线性插值到逐采样点。
+- `in_channels`、`in_samples`、`num_outputs` 总是由框架传入：`num_outputs` 二分类为 1，多分类为类别数。
+- 构造函数声明了 `fs`（采样率，Hz）或 `channel_names`（`data.channels`）时，框架也会传入；这两个名字不能写在 `model.params` 里。
+- 其余参数来自 `model.params`。名字拼错会直接报错，并提示最接近的参数名。
+- 输出分辨率低于输入时（`T' < T`），框架在计算损失和推理前把 logits 线性插值到逐采样点：`T'` 个值视为覆盖输入的 `T'` 个等长单元的中心。可以设 `output_stride = T / T'`，仅作说明用。
 - 需要多阶段/深监督或额外损失（例如异常检测式的重构损失）时，返回 `lteeg.models.ModelOutput(logits, aux_logits=[...], losses={"recon": ...})`：每个 `aux_logits` 用同样的主损失计算后相加，`losses` 中的项直接加到总损失上并分别记录。
 - 需要病人/位置信息的模型（病人条件化、测试时自适应等）设 `wants_meta = True`，`forward(x, meta)` 会收到 `patient`、`rec`、`start` 张量；推理时病人未知，`patient` 为 -1。
-- 接入后先跑 `python -m lteeg check-model --set model.name=my_unet --overfit-steps 50`：检查输出形状、前后向耗时与显存，并在单个 batch 上过拟合，确认损失能下降。
-- 自定义模块所在的包需在 `PYTHONPATH` 中；若用装饰器注册，需在 `lteeg/models/__init__.py` 中 import 它，或直接用 `"包.模块:类名"` 形式。
+- 需要加载原实现保存的权重时，定义静态方法 `convert_state_dict(state) -> state`，`model.init_checkpoint` 会先经过它（SeizureTransformer 用它去掉 `module.` 前缀和冗余层）。
+- `forward` 不得原地修改输入；会影响输出的状态必须注册为参数或持久 buffer。
+
+### 自动检查
+
+`tests/test_model_contract.py` 对 `lteeg/models/` 下的每个模型文件夹（使用其 `SMOKE_PARAMS`，二分类和三分类各一次）运行 `lteeg.models.contract.check_contract`，检查：
+
+- 输出的类型、形状和数值有限；
+- 梯度能传到参数；
+- 不会原地修改输入；
+- eval 模式结果可复现；
+- 同一 batch 的样本之间互不影响（逐个计算与整批计算一致）；
+- `state_dict` 能严格载入一个新实例，且结果相同。
+
+另外还会检查文件夹结构是否完整（`model.py`、`layers/`、`README.md`、`SMOKE_PARAMS`），以及默认参数能否构建。`tests/test_end_to_end.py` 让每个模型在合成数据上走完训练、长程验证和最终评估。
+
+在真实配置下检查（真实窗长和 batch，GPU 上报告峰值显存；检查时临时关闭 TF32，避免误判）：
+
+```bash
+python -m lteeg check-model --set model.name=my_net "model.params={depth: 5}" --batch-size 86 --overfit-steps 50
+```
+
+`--overfit-steps` 会在单个合成 batch 上训练若干步，确认损失能下降。
 
 ## 扩展：新数据集、多分类、新组件
 

@@ -1,6 +1,7 @@
 """Full pipeline on the synthetic dataset: cache -> sampler -> train -> long-range eval -> sweep -> predict."""
 
 import csv
+import json
 import pickle
 
 import numpy as np
@@ -10,6 +11,7 @@ from lteeg import workflows
 from lteeg.data.cache import SignalCache
 from lteeg.data.datasets import TrainWindowDataset
 from lteeg.data.loading import load_recordings
+from lteeg.models import available_models, smoke_params
 from lteeg.utils import read_json
 
 FAST = ["model.name=tcn", "model.params={hidden: 16, levels: 4}", "windows.length_sec=10",
@@ -65,12 +67,17 @@ def test_training_options_smoke(synthetic_cfg):
     assert (run_dir / "checkpoints/best.pt").exists()
 
 
-def test_seizure_transformer_trains(synthetic_cfg):
-    cfg = synthetic_cfg("model.params={num_layers: 1, dim_feedforward: 64}", "windows.length_sec=10",
-                        "windows.train_stride_sec=5", "train.epochs=1", "train.batch_size=4", "train.log_every=0",
-                        "evaluation.splits=[]")
+@pytest.mark.parametrize("name", available_models())
+def test_every_model_trains_and_evaluates(synthetic_cfg, name):
+    """Each model package (with its SMOKE_PARAMS) runs through training, long-range
+    validation and the final evaluation."""
+    cfg = synthetic_cfg(f"model.name={name}", f"model.params={json.dumps(smoke_params(name))}",
+                        "windows.length_sec=10", "windows.train_stride_sec=5", "train.epochs=1",
+                        "train.batch_size=4", "train.log_every=0", "evaluation.save_probs=false",
+                        "evaluation.sweep_thresholds=[0.5]")
     run_dir = workflows.train(cfg)
-    assert (run_dir / "checkpoints/best.pt").exists()
+    metrics = read_json(run_dir / "eval/dev_best/summary.json")["metrics"]
+    assert np.isfinite(metrics["auroc_pooled"]) and np.isfinite(metrics["nll_pooled"])
 
 
 def test_dataset_pickles_for_spawned_workers(synthetic_cfg):

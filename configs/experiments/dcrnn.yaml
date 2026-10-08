@@ -1,0 +1,33 @@
+# DCRNN (Li et al., ICLR 2018) in the EEG setting of Tang et al. (ICLR 2022):
+# 1-s log-amplitude FFT node features, a correlation graph per window (top-3 neighbours,
+# dual random walk), 2 DCGRU layers x 64 units, one logit per second. Optimiser settings
+# follow Tang et al.: Adam lr 3e-4, L2 5e-4, cosine annealing, gradient clipping 5, batch 40.
+# Model details and deviations: lteeg/models/dcrnn/README.md
+_base_: ../chbmit.yaml
+
+experiment:
+  name: dcrnn
+
+model:
+  name: dcrnn
+  params:
+    step_sec: 1.0
+    features: fft
+    graph: correlation
+    top_k: 3
+    num_rnn_layers: 2
+    rnn_units: 64
+    max_diffusion_step: 2
+    dropout: 0.0
+
+optimizer:
+  name: adam
+  lr: 3.0e-4
+  weight_decay: 5.0e-4
+
+scheduler:
+  name: cosine
+
+train:
+  batch_size: 40
+  grad_clip: 5.0

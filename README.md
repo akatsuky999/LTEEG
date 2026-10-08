@@ -9,7 +9,7 @@ LTEEG 是一个研究框架，用来做**长程脑电（long-term EEG）的癫�
 
 训练好的模型不在切好的样本集合上评估，而是**放回每个病人完整的长程记录上连续推理**，再按领域通用的 SzCORE 规则做事件级打分，结果逐病人呈现。
 
-框架内置的 baseline 是 **SeizureTransformer**（Wu et al., 2025），它是 2025 年 SzCORE 癫痫检测挑战赛的第一名。移植后与原实现逐点数值一致，最大误差约 1e-7。
+框架内置的默认 baseline 是 **SeizureTransformer**（Wu et al., 2025），它是 2025 年 SzCORE 癫痫检测挑战赛的第一名；另有图循环网络 **DCRNN**（Li et al., 2018；Tang et al., 2022）和轻量的 **TCN**。每个模型一个文件夹（参考清华 Time-Series-Library 的组织方式），移植的模型都与参考实现逐项核对过：SeizureTransformer 最大误差约 1e-7，DCRNN 约 1.5e-7。
 
 LTEEG 完全自包含，不依赖原项目的任何代码和路径，只依赖 numpy、scipy、h5py、pyyaml、torch，可以在 Windows 下运行。
 
@@ -50,7 +50,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 cd LTEEG
 pip install -e .          # 安装 lteeg 包本身及 numpy / scipy / h5py / pyyaml
 pip install -e .[dev]     # 可选：pytest、timescoring、scikit-learn，用来跑测试
-python -m pytest -q       # 74 个测试，约半分钟，应全部通过
+python -m pytest -q       # 125 个测试，约半分钟，应全部通过
 ```
 
 要求 Python ≥ 3.9，torch ≥ 2.0。
@@ -235,24 +235,63 @@ full 窗:                       [ 全是发作 ]                  ← 发作长�
 
 ## 第三步：模型
 
-框架对模型只有一个约定：
+### 模型怎么组织
+
+参考清华 Time-Series-Library 的做法，**每个模型一个文件夹，文件夹名就是模型名**：
+
+```
+lteeg/models/
+├── base.py                 所有模型共同遵守的约定（写新模型前先读它）
+├── contract.py             把约定写成可执行的检查
+├── _template/              新模型的模板，复制它开始
+├── seizure_transformer/
+│   ├── __init__.py         导出 Model（模型类）和 SMOKE_PARAMS（快速测试用的小参数）
+│   ├── model.py            网络主体：把各个模块组装起来
+│   ├── layers/             这个模型自己的模块（编码器、残差块、位置编码……）
+│   └── README.md           来源、参数、与参考实现的差异、核验结果
+├── tcn/                    结构同上
+└── dcrnn/                  结构同上
+```
+
+配置里写 `model.name: dcrnn`，框架就导入 `lteeg/models/dcrnn/` 并实例化它的 `Model`。只有被选中的模型会被导入，一个模型的依赖或错误不会影响其他模型。不需要任何注册步骤，加一个文件夹就够了。`python -m lteeg list-models` 列出全部内置模型及其参数和默认值。
+
+### 模型约定
 
 ```python
 Model(in_channels, in_samples, num_outputs, **model.params)
 forward(x)              # x: (B, C, T)，已预处理的 float32
-  -> logits             # (B, num_outputs, T)，每个采样点一个 logit
+  -> logits             # (B, num_outputs, T')，1 ≤ T' ≤ T
 ```
 
 只要满足这个约定，任何网络都可以接入。几个灵活之处：
 
-- **输出可以比输入短**：例如 patch / token 级的模型只在 1/8 分辨率上输出，框架会自动把 logits 线性插值回逐采样点。内置的 TCN 就是这种情况。
+- **输出可以比输入短**：例如 patch / token 级或"每秒一个输出"的模型，框架会自动把 logits 线性插值回逐采样点。内置的 TCN 和 DCRNN 都是这种情况。
+- **可以向框架要信息**：构造函数里声明了 `fs`（采样率）或 `channel_names`（导联名），框架就会自动传入，例如 DCRNN 用 `fs` 把信号切成 1 秒一段。这两个值不能写在 `model.params` 里。
 - **可以有多个输出和附加损失**：返回 `ModelOutput(logits, aux_logits=[...], losses={...})`。多阶段或深监督网络把中间输出放进 `aux_logits`；异常检测式的重构损失这类附加项放进 `losses`。
 - **可以拿到病人信息**：在类上设 `wants_meta = True`，`forward(x, meta)` 就能收到病人编号、记录编号和窗口位置，可用于病人条件化或测试时自适应。
+- **可以加载原作者的权重**：在类上定义 `convert_state_dict(state)`，`model.init_checkpoint` 加载外部权重时会先经过它转换。
 - **二分类和多分类**：二分类输出 1 个通道，经 sigmoid 得到发作概率；多分类输出 K 个通道，经 softmax 后用 1 − p(背景) 作为"任意发作"概率。所以评估不需要为多分类单独改代码。
 
-### 内置的 SeizureTransformer
+**约定由测试自动检查。**`tests/test_model_contract.py` 会对 `lteeg/models/` 下的每个模型文件夹（用它的 `SMOKE_PARAMS`）检查以下各项，新加的文件夹自动纳入：
 
-这是一个 U 形网络：
+- 输出的类型、形状和数值有限；
+- 梯度能传到参数；
+- 不会原地修改输入；
+- eval 模式下结果可复现；
+- 同一个 batch 里的样本互不影响；
+- `state_dict` 能严格地存取。
+
+`tests/test_end_to_end.py` 还会让每个模型都在合成数据上完整走一遍训练、长程验证和最终评估。`python -m lteeg check-model` 用真实配置（真实窗长和 batch）跑同一套检查，并报告参数量、耗时和显存。
+
+### 内置模型
+
+| 模型 | 来源 | 输出分辨率 | 默认参数量 | 配置 |
+|---|---|---|---|---|
+| `seizure_transformer` | Wu et al., 2025；2025 SzCORE 挑战赛第一名 | 每个采样点 | 37.85M | 默认配置 |
+| `dcrnn` | Li et al., ICLR 2018；Tang et al., ICLR 2022 的 EEG 设置 | 每秒一个 | 0.31M | `configs/experiments/dcrnn.yaml` |
+| `tcn` | 本框架自带的轻量膨胀卷积网络 | 每 8 个采样点 | 0.15M | `configs/experiments/tcn_debug.yaml` |
+
+**SeizureTransformer** 是一个 U 形网络：
 
 - **编码器**：5 级卷积，每级长度减半，15360 → 480；
 - **瓶颈**：7 个残差卷积块，加上 8 层 Transformer，对 480 个 token 做全局注意力；
@@ -266,7 +305,16 @@ forward(x)              # x: (B, C, T)，已预处理的 float32
 - 支持任意长度 ≥ 32 的输入，改窗长做实验不用改模型；
 - 参数名保持不变，原作者的权重可以直接加载。
 
-代码：`lteeg/models/`。
+**DCRNN** 把每个导联当作图上的一个节点：
+
+1. 把 60 秒窗口切成 60 个 1 秒的时间步，每个导联每秒取 FFT 对数幅度谱作为节点特征；
+2. 按导联之间的相关性给每个窗口建一张图；
+3. 用"扩散卷积 + GRU"沿时间递推；
+4. 每秒输出一个 logit。
+
+在相同权重和输入下，与参考实现（tsy935/eeg-gnn-ssl）的 60 个时间步输出最大误差为 1.5e-7。
+
+每个模型的细节见各自文件夹里的 README。
 
 ---
 
@@ -482,6 +530,7 @@ Windows 路径请写成 `F:/EEG/CHB-MIT`，或者用单引号括起来写成 `'F
 |---|---|
 | `original_faithful.yaml` | 完全复现原项目的逐窗滤波与末窗补零，用来量化框架默认值带来的差异 |
 | `tcn_debug.yaml` | 小模型，在真实数据上快速打通流程 |
+| `dcrnn.yaml` | DCRNN 图循环网络，采用 Tang et al. (ICLR 2022) 的训练设置 |
 | `st_robust_training.yaml` | 打开常用的稳定化手段（每轮重抽背景、AdamW + 余弦、bf16、梯度裁剪、EMA、增强），作为对照实验的起点，**尚未在真实数据上验证** |
 
 ---
@@ -489,6 +538,27 @@ Windows 路径请写成 `F:/EEG/CHB-MIT`，或者用单引号括起来写成 `'F
 ## 怎么接入自己的网络和数据集
 
 ### 新网络
+
+**方式一：放进框架（推荐，适合要长期维护、和 baseline 一起比较的模型）**
+
+```bash
+cp -r lteeg/models/_template lteeg/models/my_net      # 文件夹名就是模型名
+```
+
+然后：
+
+1. 在 `model.py` 里实现网络；
+2. 把用到的模块放进 `layers/`；
+3. 在 `__init__.py` 里写 `Model = 你的类`，并给一组很小的 `SMOKE_PARAMS`；
+4. 把 `README.md` 改成你的模型说明（来源、参数、与参考实现的差异、核验）。
+
+```bash
+python -m pytest tests/test_model_contract.py                         # 新文件夹自动纳入约定检查
+python -m lteeg check-model --set model.name=my_net --overfit-steps 50  # 真实窗长下自检，并在一个 batch 上过拟合
+python -m lteeg train --set model.name=my_net "model.params={hidden: 64}"
+```
+
+**方式二：留在框架外（适合临时试验）**
 
 ```python
 # my_models/unet.py
@@ -501,17 +571,17 @@ class MyUNet(nn.Module):
 
     def forward(self, x):       # x: (B, C, T)
         ...
-        return logits           # (B, num_outputs, T)
+        return logits           # (B, num_outputs, T')
 ```
 
-不需要修改框架，在配置里写 `模块路径:类名` 即可：
+不需要修改框架，在配置里写 `模块路径:类名` 即可（`my_models` 所在目录需要在 `PYTHONPATH` 中）：
 
 ```bash
-# 先自检：检查输出形状、测速度和显存，并在一个 batch 上过拟合，确认损失能降下去
 python -m lteeg check-model --set "model.name=my_models.unet:MyUNet" "model.params={depth: 5}" --overfit-steps 50
-# 再训练
 python -m lteeg train --set "model.name=my_models.unet:MyUNet" "model.params={depth: 5}"
 ```
+
+两种方式遵守同一份约定（`lteeg/models/base.py`），写错参数名会直接报错，并提示最接近的正确名字。
 
 新的损失函数、预处理算子、数据增强也可以用同样的方式接入，模板见 [docs/reference.md](docs/reference.md)。
 
@@ -549,7 +619,8 @@ data:
 | `python -m lteeg sweep <eval目录>` | 在存好的概率上换阈值重新打分 |
 | `python -m lteeg compare runs/chbmit` | 多个实验并排比较 |
 | `python -m lteeg predict <best.pt> <h5 文件或目录> --out preds/` | 对新记录输出发作起止时间（TSV） |
-| `python -m lteeg check-model` | 新网络接入自检 |
+| `python -m lteeg list-models` | 列出内置模型、可调参数和默认值 |
+| `python -m lteeg check-model` | 在真实窗长和 batch 下检查模型约定，报告参数量、耗时、显存 |
 | `python -m lteeg make-synthetic --out <目录>` | 生成同格式的合成数据 |
 
 ---
@@ -566,7 +637,11 @@ LTEEG/
 ├── lteeg/
 │   ├── config.py               配置的加载与校验
 │   ├── data/                   第一、二步：读取、核对、缓存、窗口、采样、样本
-│   ├── models/                 第三步：模型约定、SeizureTransformer、TCN
+│   ├── models/                 第三步：模型约定与检查；每个模型一个文件夹
+│   │   ├── _template/          新模型模板
+│   │   ├── seizure_transformer/  model.py + layers/ + README.md
+│   │   ├── dcrnn/
+│   │   └── tcn/
 │   ├── losses.py               逐点损失
 │   ├── engine/                 第四步：训练循环、优化器、检查点
 │   ├── inference/              第五步：整段推理、后处理
@@ -575,7 +650,7 @@ LTEEG/
 ├── docs/
 │   ├── reference.md            详细参考手册：所有配置项、每个模块、扩展模板
 │   └── design_notes.md         设计取舍、调研笔记、数值核验记录
-└── tests/                      74 个测试
+└── tests/                      125 个测试（含每个模型的约定检查与端到端训练）
 ```
 
 ---
@@ -598,7 +673,8 @@ LTEEG/
 3. **背景覆盖**：打开 `sampling.redraw_every_epoch`，看误报是否下降。
 4. **病人平衡**：打开 `sampling.group_by: patient`，看最差病人是否改善。
 5. **输出平滑**：在损失里加上 `tmse`，看碎片化误报是否减少。
-6. **阈值**：对上面每个实验用 `sweep` 选工作点，再用 `compare` 汇总。注意，在 dev 上选出的阈值迁移到 test 时才是公平的数字。
+6. **换一类模型**：用 `dcrnn.yaml` 训练 DCRNN，与 SeizureTransformer 在同一套长程评估下比较。
+7. **阈值**：对上面每个实验用 `sweep` 选工作点，再用 `compare` 汇总。注意，在 dev 上选出的阈值迁移到 test 时才是公平的数字。
 
 ---
 
@@ -606,7 +682,10 @@ LTEEG/
 
 - K. Wu, Z. Zhao, B. Yener. *Large EEG-U-Transformer for Time-Step Level Detection Without Pre-Training* (SeizureTransformer). arXiv:2504.00336, 2025.
 - J. Dan et al. *SzCORE: Seizure Community Open-Source Research Evaluation framework for the validation of EEG-based automated seizure detection algorithms*. Epilepsia, 2024.
-- J. Dan et al. *SzCORE as a benchmark: report from the seizure detection challenge at the 2025 AI in Epilepsy and Neurological Disorders Conference*. arXiv:2505.18191.
+- J. Dan et al. *SzCORE as a benchmark: report from the seizure detection challenge at the 2025 AI in Epilepsy and Neurological Disorders Conference*. arXiv:2505.18191（正式版：*Quantifying the Generalization Gap in Seizure Detection*, ICML 2026）。
+- Y. Li, R. Yu, C. Shahabi, Y. Liu. *Diffusion Convolutional Recurrent Neural Network: Data-Driven Traffic Forecasting*. ICLR 2018（DCRNN）。
+- S. Tang et al. *Self-Supervised Graph Neural Networks for Improved Electroencephalographic Seizure Analysis*. ICLR 2022（DCRNN 的 EEG 设置）。
+- Time-Series-Library (THUML, Tsinghua University). https://github.com/thuml/Time-Series-Library（模型目录组织方式的参考）。
 - A. Shoeb. *Application of machine learning to epileptic seizure onset detection and treatment*. PhD thesis, MIT, 2009（CHB-MIT 数据集）。
 - Y. A. Farha, J. Gall. *MS-TCN: Multi-Stage Temporal Convolutional Network for Action Segmentation*. CVPR 2019（tmse 平滑损失）。
 - M. Perslev et al. *U-Sleep: resilient high-frequency sleep staging*. npj Digital Medicine, 2021.

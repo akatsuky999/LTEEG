@@ -10,7 +10,8 @@ Commands
     sweep           re-score stored probabilities over thresholds / min durations
     compare         side-by-side table of several runs (pooled, macro, worst patient, per patient)
     predict         annotate arbitrary HDF5 recordings (events TSV per file)
-    check-model     verify a model plugs into the framework (shapes, speed, overfit test)
+    list-models     list the built-in models with their parameters and defaults
+    check-model     run the model-contract checks at the real input size (speed, memory, overfit test)
     make-synthetic  write a small CHB-MIT-like synthetic dataset for smoke tests
 
 Without ``--config`` the CHB-MIT config shipped in ``configs/chbmit.yaml`` is used.
@@ -93,7 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     p.add_argument("--save-probs", action="store_true")
 
-    p = sub.add_parser("check-model", help="sanity-check a model against the framework contract")
+    sub.add_parser("list-models", help="list the built-in models (lteeg/models/<name>/) and their parameters")
+
+    p = sub.add_parser("check-model", help="verify a model against the framework contract")
     _add_config_args(p)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--overfit-steps", type=int, default=0)
@@ -113,14 +116,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .config import ConfigError
     from .data.annotations import AnnotationError
     from .data.store import DataValidationError
+    from .models.contract import ModelContractError
     from .registry import RegistryError
     from .utils.logging import setup_logging
 
     setup_logging()
     try:
         _run(args)
-    except (ConfigError, RegistryError, DataValidationError, AnnotationError, FileNotFoundError,
-            FileExistsError) as e:
+    except (ConfigError, RegistryError, DataValidationError, AnnotationError, ModelContractError,
+            FileNotFoundError, FileExistsError) as e:
         if os.environ.get("LTEEG_DEBUG"):
             raise
         print(f"\nerror ({type(e).__name__}): {e}\n(set LTEEG_DEBUG=1 for a traceback)", file=sys.stderr)
@@ -164,10 +168,27 @@ def _run(args: argparse.Namespace) -> None:
         compare(args.paths, args.out)
     elif args.command == "predict":
         workflows.predict(args.checkpoint, args.inputs, args.out, args.set, args.save_probs)
+    elif args.command == "list-models":
+        _list_models()
     elif args.command == "check-model":
         workflows.check_model(_load(args), args.batch_size, args.overfit_steps)
     elif args.command == "make-synthetic":
         _make_synthetic(args)
+
+
+def _list_models() -> None:
+    from .models import describe_available_models
+
+    for info in describe_available_models():
+        print(f"{info['name']}  ({info['class']}, lteeg/models/{info['name']}/)")
+        if info["summary"]:
+            print(f"    {info['summary']}")
+        if info["context"]:
+            print(f"    receives from the framework: {', '.join(info['context'])}")
+        for key, default in info["params"].items():
+            print(f"    {key} = {default!r}")
+        print()
+    print('Select one with --set model.name=<name> "model.params={...}"; details in lteeg/models/<name>/README.md')
 
 
 def _make_synthetic(args: argparse.Namespace) -> None:
