@@ -291,7 +291,9 @@ def check_model(cfg: Config, batch_size: int = 2, overfit_steps: int = 0) -> Dic
     if device.type == "cuda":
         info["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1024 ** 3
     print(f"forward/backward OK: output {tuple(logits.shape)} for input {(batch_size, cfg.n_channels, T)}, "
-          f"loss {float(loss):.4f}, {info['fwd_bwd_sec']:.2f}s")
+          f"loss {info['initial_loss']:.4f}, {info['fwd_bwd_sec']:.2f}s")
+    if "peak_mem_gb" in info:
+        print(f"peak GPU memory (fp32 forward/backward, no optimizer state): {info['peak_mem_gb']:.1f} GB")
     if overfit_steps:
         opt = torch.optim.Adam(model.parameters(), lr=1e-3)
         for step in range(overfit_steps):

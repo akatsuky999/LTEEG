@@ -75,6 +75,8 @@ python -m lteeg train          # 用默认配置训练 SeizureTransformer baseli
 
 **第一次接触真实数据，一定先跑 `inspect`。**任何标签、导联、采样率上的问题都会在这一步暴露出来，并指出具体文件和行号。
 
+在 Linux 服务器（A100）上从零开始的完整步骤：装环境、校验数据、测显存、建缓存、冒烟、正式训练、续训、训练后评估，见 [docs/launch_server.md](docs/launch_server.md)。
+
 ---
 
 ## 全景：一段 EEG 从磁盘走到分数
